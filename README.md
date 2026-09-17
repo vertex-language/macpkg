@@ -3,176 +3,124 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/vertex-language/macpkg.svg)](https://pkg.go.dev/github.com/vertex-language/macpkg)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform: Cross-Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)]()
+[![Cgo: Zero](https://img.shields.io/badge/Cgo-0%25-brightgreen.svg)]()
 
-**A 100% pure Go unified toolchain and library for assembling, signing, packaging, and notarizing Apple macOS software (`.app` bundles, `.dmg` disk images, `.pkg` installer packages, and Sparkle-compatible `.zip` archives).**
+**A 100% pure Go unified toolchain and library for assembling, signing, packaging, and notarizing Apple macOS software (`.app` bundles, `.dmg` disk images, `.pkg` installer packages, and Apple Notarization).**
 
-Zero Cgo. Zero Xcode (`xcodebuild` / `pkgbuild` / `productbuild` / `hdiutil` / `codesign` / `notarytool`). Zero Apple hardware or macOS host requirements. Works with bit-for-bit reproducibility on Linux AMD64/ARM64, macOS Apple Silicon/Intel, and Windows CI runners.
+Zero Cgo. Zero Xcode. Zero mandatory external tools (`xcodebuild`, `pkgbuild`, `productbuild`, `hdiutil`, `codesign`, `notarytool` not required). Runs with byte-for-byte reproducibility on Linux, Windows, and macOS.
 
 ---
 
 ## Table of Contents
 
 - [Overview](#overview)
-- [Why `macpkg`?](#why-macpkg)
-- [API Design Philosophy: Config Structs vs Builders](#api-design-philosophy-config-structs-vs-builders)
-- [Repository & Package Architecture](#repository--package-architecture)
-- [Format Deep Dives & Specifications](#format-deep-dives--specifications)
+- [End-to-End Packaging Flow](#end-to-end-packaging-flow)
+- [Real macOS Native Host Verification](#real-macos-native-host-verification)
+- [The 5 Core Engines](#the-5-core-engines)
   - [1. Application Bundle Engine (`app/`)](#1-application-bundle-engine-app)
-  - [2. Apple Disk Image Engine (`dmg/`)](#2-apple-disk-image-engine-dmg)
-  - [3. Flat & Distribution Installer Engine (`pkg/`)](#3-flat--distribution-installer-engine-pkg)
-  - [4. Pure Go Code Signing Engine (`sign/`)](#4-pure-go-code-signing-engine-sign)
-  - [5. Apple Notarization & Stapling Engine (`notary/`)](#5-apple-notarization--stapling-engine-notary)
-- [Declarative Manifest Specification (`macpkg.yaml`)](#declarative-manifest-specification-macpkgyaml)
-- [Go Programmatic API](#go-programmatic-api)
+  - [2. Code Signing Engine (`sign/`)](#2-code-signing-engine-sign)
+  - [3. Apple Disk Image Engine (`dmg/`)](#3-apple-disk-image-engine-dmg)
+  - [4. Flat Package Engine (`pkg/`)](#4-flat-package-engine-pkg)
+  - [5. Apple Notarization & Stapler (`notary/`)](#5-apple-notarization--stapler-notary)
 - [Command-Line Interface (CLI)](#command-line-interface-cli)
-- [Shared Infrastructure with `winpkg`](#shared-infrastructure-with-winpkg)
+  - [Installation](#installation)
+  - [CLI Commands & Examples](#cli-commands--examples)
+- [Go Programmatic API](#go-programmatic-api)
+  - [1. Assembling a `.app` Bundle](#1-assembling-a-app-bundle)
+  - [2. Code Signing with Hardened Runtime](#2-code-signing-with-hardened-runtime)
+  - [3. Building a Branded `.dmg` Disk Image](#3-building-a-branded-dmg-disk-image)
+  - [4. Compiling a Flat `.pkg` Installer](#4-compiling-a-flat-pkg-installer)
+  - [5. Unified Pipeline with `macpkg.Build`](#5-unified-pipeline-with-macpkgbuild)
+- [Hermetic & In-Memory Builds (`vfs.MemFS`)](#hermetic--in-memory-builds-vfsmemfs)
+- [Shared Architecture with `winpkg`](#shared-architecture-with-winpkg)
 - [License](#license)
 
 ---
 
 ## Overview
 
-Historically, shipping software on Apple platforms has required a macOS machine running proprietary Apple toolchains. Even cross-platform toolchains (GoReleaser, Tauri, Electron Builder, Flutter) either require paying for expensive macOS CI runners or executing fragile, reverse-engineered shell scripts and wrappers (`dmgbuild`, `libdmg-hfsplus`, `bomutils`, `xar`, `rcodesign`).
+Shipping macOS applications traditionally demands a physical Mac or expensive macOS cloud runners to invoke Apple developer tools (`codesign`, `hdiutil`, `pkgbuild`, `notarytool`).
 
-`github.com/vertex-language/macpkg` solves this by delivering **native, pure-Go implementations** of every binary format, filesystem, container, cryptographic signature, and cloud API required in the macOS software delivery lifecycle:
+`github.com/vertex-language/macpkg` replaces these external dependencies with **pure-Go implementations** of every binary container, filesystem structure, cryptographic envelope, and API required in macOS software packaging:
 
-```
-[ Mach-O Binaries & Assets ]
-              │
-              ▼
-   ┌──────────────────────┐
-   │     app.Assemble     │   Directory structure, Info.plist, .icns, universal lipo
-   └──────────┬───────────┘
-              │
-              ▼
-   ┌──────────────────────┐
-   │      sign.Sign       │   Mach-O LC_CODE_SIGNATURE, CodeResources, Hardened Runtime
-   └──────────┬───────────┘
-              │
-      ┌───────┴──────────────────────────────┐
-      ▼                                      ▼
-┌──────────────────────┐           ┌──────────────────────┐
-│      dmg.Build       │           │      pkg.Build       │
-│  UDIF block chunks   │           │  XAR XML container   │
-│  HFS+ filesystem     │           │  Apple BOM catalog   │
-│  .DS_Store B-Tree    │           │  cpio.gz stream      │
-│  SLA license dict    │           │  Distribution XML    │
-└──────────┬───────────┘           └──────────┬───────────┘
-           │                                  │
-           └─────────────────┬────────────────┘
-                             ▼
-                   ┌──────────────────────┐
-                   │    notary.Submit     │   App Store Connect REST API (JWT ES256)
-                   └─────────┬────────────┘
-                             ▼
-                   ┌──────────────────────┐
-                   │    notary.Staple     │   Inject CloudKit ticket into container
-                   └──────────────────────┘
-```
+* **`.app` Bundles**: Standard macOS bundle directory layout, `Info.plist` (XML & Apple binary `bplist00`), `PkgInfo`, and multi-resolution Apple Icon (`.icns`) encoding.
+* **Code Signing**: Embeds Mach-O `LC_CODE_SIGNATURE` `SuperBlob` structures, `CodeDirectory` (version 0x20400) page hashing, special slot binding (`Info.plist` at slot -1, `CodeResources` at slot -3), Apple canonical rule sets, and Hardened Runtime (`CS_RUNTIME`).
+* **`.dmg` Apple Disk Images**: Universal Disk Image Format (UDIF) with 512-byte `koly` trailer at EOF-512, UDZO zlib Deflate compression chunks, pure-Go HFS+ filesystem, and `.DS_Store` binary Buddy Allocator records (`Iloc`, `bwsp`, `icvp`).
+* **`.pkg` Flat Packages**: Apple Extensible Archive (XAR) container with SHA-1 TOC checksum at heap offset 0, pure-Go Apple `BOMStore` generator with B-Tree leaf layout & POSIX CRC-32 checksums, and standard POSIX odc (`070707`) streaming cpio.gz payload.
+* **Apple Notarization & Stapling**: App Store Connect API v2 client using ECDSA ES256 JWT tokens, direct parallel AWS S3 multipart upload, polling status, and CloudKit ticket extraction and offline stapling.
 
 ---
 
-## Why `macpkg`?
-
-* **100% Pure Go & Zero Cgo**: Compiles anywhere (`GOOS=linux`, `GOOS=darwin`, `GOOS=windows`). Generate fully signed, notarized DMGs and PKGs directly inside standard Ubuntu Linux Docker containers.
-* **Hermetic & In-Memory (`vfs.MemFS`)**: Entire pipelines can run without touching the host disk. Perfect for unit testing, reproducible CI builds, and byte-for-byte deterministic package hashes.
-* **Zero Host Toolchains**: No `hdiutil`, no `pkgbuild`, no `productbuild`, no `codesign`, and no `altool`/`notarytool`.
-* **Full Gatekeeper Compliance**: Creates valid `SuperBlob` code signatures with Hardened Runtime flags (`CS_RUNTIME = 0x10000`), SHA-256 resource trees, entitlements, and offline ticket stapling compatible with macOS 10.15 (Catalina) through macOS 15+ (Sequoia).
-
----
-
-## API Design Philosophy: Config Structs vs Builders
-
-In Go, heavily chained "fluent" builders (`builder.WithName().WithVersion().Build()`) are widely considered an un-idiomatic anti-pattern borrowed from Java/C#. Fluent builders introduce two major problems in Go:
-1. **Error propagation**: Every chained method must either return an error (which destroys chaining) or defer error reporting until `Build()`, hiding where invalid state was introduced.
-2. **Impedance mismatch with serialization**: A fluent builder cannot be deserialized directly from YAML or JSON.
-
-Following standard Go library practices (`http.Server`, `exec.Cmd`, `tls.Config`, and `winpkg/msi`):
-
-> **`macpkg` uses declarative `Config` structs with zero-value defaults.**
-
-* **Declarative & Typed**: Struct literals provide self-documenting named fields.
-* **Direct Serialization**: `macpkg.yaml` maps directly to Go config structs via `yaml.Unmarshal`.
-* **Clean Error Handling**: Constructors and execution functions take a `context.Context` and a `Config` struct, returning `(Result, error)` synchronously and reliably.
-
----
-
-## Repository & Package Architecture
-
-Every macOS format is an intricate binary specification. Rather than monolithic files, each format is organized into dedicated, cohesive subpackages:
+## End-to-End Packaging Flow
 
 ```
-macpkg/
-├── macpkg.go                      # Top-level unified facade (auto-detect manifest & build)
-├── macpkg_test.go                 # End-to-end integration tests (in-memory pipeline)
-├── go.mod                         # module github.com/vertex-language/macpkg
-├── README.md                      # Documentation & format specifications
-├── LICENSE                        # MIT License
-│
-├── vfs/                           # [SHARED] Virtual Filesystem (MemFS, DiskFS/RealFS)
-├── run/                           # [SHARED] Process runner abstraction & test seams
-│
-├── app/                           # [FORMAT] Application Bundle (.app) Engine
-│   ├── app.go                     # app.Assemble, app.Config, app.Bundle
-│   ├── app_test.go
-│   ├── plist/                     # Property List XML & Apple binary bplist00 parser/serializer
-│   ├── icns/                      # Apple Icon Image (.icns) multi-resolution encoder
-│   ├── lipo/                      # Universal Mach-O fat binary packager (arm64 + x86_64)
-│   ├── rpath/                     # Mach-O load command dynamic linker path editor (@rpath)
-│   └── structure/                 # Standard bundle layout generator & PkgInfo (APPL????)
-│
-├── dmg/                           # [FORMAT] Apple Disk Image (.dmg) Engine
-│   ├── dmg.go                     # dmg.Build, dmg.Config, dmg.Inspect
-│   ├── dmg_test.go
-│   ├── udif/                      # Universal Disk Image Format (512-byte koly trailer & blkx)
-│   ├── hfs/                       # In-memory HFS+ volume, catalog B-Tree & allocation bitmap
-│   ├── dsstore/                   # .DS_Store binary Buddy Allocator & Finder layout (Iloc, bwsp, icvp)
-│   └── sla/                       # Software License Agreement multilingual LPic/XML resource dictionary
-│
-├── pkg/                           # [FORMAT] Flat & Distribution Installer (.pkg) Engine
-│   ├── pkg.go                     # pkg.Build, pkg.Config, pkg.Inspect
-│   ├── pkg_test.go
-│   ├── xar/                       # Extensible Archive (XAR) XML TOC, header & compressed heap
-│   ├── bom/                       # Apple Bill of Materials (BOMStore) binary VTree indexer
-│   ├── cpio/                      # Streaming SVR4 portable cpio (070701) archive encoder
-│   ├── packageinfo/               # PackageInfo XML manifest generator & validator
-│   ├── distribution/              # Distribution XML product definition (choices, requirements)
-│   └── scripts/                   # preinstall, postinstall, and upgrade hook script manager
-│
-├── sign/                          # [SECURITY] Pure-Go Code Signing Engine
-│   ├── sign.go                    # sign.SignFile, sign.SignBundle, sign.Config
-│   ├── sign_test.go
-│   ├── macho/                     # Mach-O LC_CODE_SIGNATURE SuperBlob & CodeDirectory builder
-│   ├── coderesources/             # _CodeSignature/CodeResources SHA-256 tree hasher
-│   ├── entitlements/              # Hardened runtime flags & entitlements XML/DER embedding
-│   ├── cms/                       # RFC 5652 PKCS#7 / CMS cryptographic envelope & RFC 3161 timestamping
-│   └── cert/                      # Developer ID cert loader (PKCS#12 .p12, PEM, Apple Root CA)
-│
-├── notary/                        # [SECURITY] Apple Notarization & Stapling Engine
-│   ├── notary.go                  # notary.Submit, notary.Staple, notary.Config
-│   ├── notary_test.go
-│   ├── jwt/                       # App Store Connect API token minter (ECDSA ES256)
-│   ├── client/                    # Notary REST API v2 HTTP client & AWS S3 presigned uploader
-│   └── staple/                    # CloudKit ticket extractor & injector (XAR header & UDIF trailer)
-│
-├── internal/
-│   └── cli/                       # [INTERNAL] Unified CLI Engine
-│       ├── cli.go                 # Root dispatcher & auto-detect
-│       ├── cmd_app.go             # macpkg app commands
-│       ├── cmd_dmg.go             # macpkg dmg commands
-│       ├── cmd_pkg.go             # macpkg pkg commands
-│       ├── cmd_sign.go            # macpkg sign commands
-│       ├── cmd_notary.go          # macpkg notary commands
-│       └── cli_test.go            # Full CLI integration test suite
-│
-└── cmd/
-    └── macpkg/
-        └── main.go                # CLI binary entrypoint
+                [ Raw Mach-O Executable (arm64 / x86_64) ]
+                                    │
+                                    ▼
+       1. Assemble Application Bundle (.app) [app.Assemble / macpkg app build]
+          - Generates Contents/MacOS/<exec>
+          - Generates Contents/Info.plist (XML Plist)
+          - Generates Contents/PkgInfo (APPL????)
+          - Encodes Contents/Resources/<icon>.icns
+                                    │
+                                    ▼
+       2. Cryptographic Code Signing [sign.Sign / macpkg sign]
+          - Hashes bundle resources -> Contents/_CodeSignature/CodeResources
+          - Binds Info.plist (slot -1) and CodeResources (slot -3) in CodeDirectory
+          - Injects LC_CODE_SIGNATURE SuperBlob with Hardened Runtime (CS_RUNTIME)
+          - Ad-hoc signature ("-") or Developer ID Application certificate
+                                    │
+                  ┌─────────────────┴─────────────────┐
+                  │                                   │
+                  ▼                                   ▼
+       3a. Disk Image (.dmg)               3b. Flat Package (.pkg)
+           [dmg.Build / macpkg dmg build]       [pkg.Build / macpkg pkg build]
+           - HFS+ Volume filesystem             - POSIX odc 070707 cpio.gz Payload
+           - .DS_Store Finder layout            - Apple BOMStore Bill of Materials
+             (Icon positions, window bounds)    - PackageInfo XML metadata
+           - Applications symlink               - XAR archive container
+           - UDIF compressed chunks (UDZO)        (SHA-1 TOC checksum in heap)
+           - 512-byte koly trailer
+                  │                                   │
+                  └─────────────────┬─────────────────┘
+                                    │
+                                    ▼
+       4. Apple Notarization & Stapling [notary.Submit / staple.Staple]
+          - Mint App Store Connect API JWT token (ES256 ECDSA P-256)
+          - Submit artifact to Apple Notary API v2
+          - Stream upload chunks to presigned AWS S3 storage
+          - Poll status until "Accepted"
+          - Staple CloudKit ticket directly into .app, .dmg, or .pkg
 ```
 
 ---
 
-## Format Deep Dives & Specifications
+## Real macOS Native Host Verification
+
+Every format produced by `macpkg` is tested and verified directly on macOS against Apple's native host tools:
+
+```
+======================================================================
+  macpkg Real macOS Native Host Verification Results
+======================================================================
+[✓] Clang / Cocoa arm64 Mach-O: Compiled & tested headless execution
+[✓] macpkg app build:           Assembled valid macOS application bundle
+[✓] macpkg sign:                Signed with ad-hoc identity & hardened runtime
+[✓] codesign --verify:          "valid on disk", "satisfies Designated Requirement"
+[✓] macpkg dmg build:           Generated compressed UDZO disk image
+[✓] hdiutil attach / detach:    Mounted volume, verified .DS_Store, executed app, detached cleanly
+[✓] macpkg pkg build:           Built flat installer package
+[✓] /usr/bin/xar:               Listed & extracted PackageInfo, Bom, and Payload
+[✓] /usr/bin/lsbom:             Parsed permissions, uid/gid 0/80, sizes, and CRC-32 checksums
+[✓] pkgutil --expand-full:      Unpacked full directory hierarchy & executables
+[✓] /usr/sbin/installer:        LIVE INSTALL COMPLETED: "The upgrade was successful"
+[✓] Installed App Run:          /Users/galaxy/Applications/SampleApp.app executed successfully
+======================================================================
+```
+
+---
+
+## The 5 Core Engines
 
 ### 1. Application Bundle Engine (`app/`)
 
@@ -182,163 +130,174 @@ An Application Bundle is a structured directory hierarchy recognized by macOS La
   * Pure Go serializer and deserializer for both **XML property lists** (`<!DOCTYPE plist ...>`) and **Apple Binary Property Lists** (`bplist00`).
   * Enforces mandatory `Info.plist` keys: `CFBundleIdentifier`, `CFBundleExecutable`, `CFBundlePackageType` (`APPL`), `CFBundleShortVersionString`, `CFBundleVersion`, `LSMinimumSystemVersion`, and `NSHighResolutionCapable`.
 * **`icns/` (Apple Icon Images)**:
-  * Encodes multi-resolution icon containers (`.icns`) from a single high-resolution source image (e.g. 1024x1024 PNG).
-  * Automatically packs all required Apple OSType chunk markers:
-    * Standard: `ic07` (128x128), `ic08` (256x256), `ic09` (512x512), `ic10` (1024x1024 / 512x512@2x Retina).
-    * High-DPI: `ic11` (16x16@2x), `ic12` (32x32@2x), `ic13` (128x128@2x), `ic14` (256x256@2x).
-* **`lipo/` (Universal Fat Binaries)**:
-  * Reads multiple single-architecture Mach-O executables (e.g. `darwin/arm64` and `darwin/amd64`) and produces a universal Mach-O binary containing the `FatHeader` (`0xCAFEBABE`) and aligned `FatArch` offsets.
-* **`rpath/` (Dynamic Linker Paths)**:
-  * Inspects and rewrites Mach-O load commands (`LC_LOAD_DYLIB`, `LC_RPATH`, `LC_ID_DYLIB`) to ensure bundled frameworks and dynamic libraries resolve relative to `@executable_path/../Frameworks` or `@rpath`.
+  * Encodes multi-resolution icon containers (`.icns`) from raw PNG or image sources.
+  * Supports standard Apple OSType markers: `ic07` (128x128), `ic08` (256x256), `ic09` (512x512), and `ic10` (1024x1024 / 512x512@2x Retina).
+* **`structure/` (Bundle Hierarchy)**:
+  * Creates `Contents/MacOS`, `Contents/Resources`, `Contents/_CodeSignature`, and generates `Contents/PkgInfo` (`APPL????`).
 
 ---
 
-### 2. Apple Disk Image Engine (`dmg/`)
+### 2. Code Signing Engine (`sign/`)
+
+macOS Gatekeeper mandates cryptographic signatures on all executables and application bundles.
+
+* **`macho/` (Mach-O Code Directory & SuperBlob)**:
+  * Serializes the `SuperBlob` structure (`CSMAGIC_EMBEDDED_SIGNATURE = 0xfade0cc0`) into the binary's `LC_CODE_SIGNATURE` load command.
+  * Emits `CS_CodeDirectory` (version `0x20400`) with SHA-256 code slot hashes computed for every 4096-byte page of the executable.
+  * Correctly computes and binds negative special slots:
+    * **Slot -1**: `Info.plist` SHA-256 digest
+    * **Slot -2**: Requirements blob (`CSMAGIC_REQUIREMENTS = 0xfade0c01`)
+    * **Slot -3**: `CodeResources` SHA-256 digest
+    * **Slot -5**: Entitlements XML blob (`CSMAGIC_EMBEDDED_ENTITLEMENTS = 0xfade0c05`)
+    * **Slot -7**: DER-encoded entitlements
+* **`coderesources/` (Resource Directory Tree Hashing)**:
+  * Generates `Contents/_CodeSignature/CodeResources` with Apple's canonical rules (13 rules) and SHA-1 / SHA-256 hashes of all resources and nested binaries.
+* **Hardened Runtime**:
+  * Sets the `CS_RUNTIME` bitflag (`0x10000`) in the `CodeDirectory`, required for Apple Notarization.
+
+---
+
+### 3. Apple Disk Image Engine (`dmg/`)
 
 Apple Disk Images are mountable virtual block devices wrapped in a Universal Disk Image Format (UDIF) container.
 
 * **`udif/` (Universal Disk Image Format)**:
-  * **Trailer Architecture (`koly`)**: Modern `.dmg` files do not have a magic header at byte 0; they are identified by a **512-byte `koly` trailer block** located at offset `EOF - 512`.
-  * Serializes the `koly` block (`0x6B6F6C79`): header version (`4`), sector counts, XML metadata descriptor offsets, and chunk table checksums.
-  * **Chunk Descriptors (`blkx`)**: Generates compressed chunk streams:
-    * `0x00000000`: Zero-fill / empty blocks
-    * `0x00000001`: Raw uncompressed data
-    * `0x00000002`: Ignored / sparse blocks
-    * `0x80000005`: `UDZO` zlib Deflate compression
-    * `0x80000007`: `ULFO` LZFSE Apple-proprietary compression
-    * `0xFFFFFFFF`: Stream terminator
-* **`hfs/` (In-Process HFS+ Filesystem)**:
-  * Serializes a valid, clean **HFS+ (Hierarchical File System Plus)** volume directly in memory without calling `hdiutil` or mounting loopback devices.
-  * Constructs the `HFSPlusVolumeHeader` (`0x482B`), Allocation File bitmap, Extents Overflow B-Tree, and Catalog B-Tree containing the `.app` bundle hierarchy and the `/Applications` symlink.
-* **`dsstore/` (Finder Layout & Presentation)**:
-  * Reverse-engineers Apple's proprietary `.DS_Store` binary database.
-  * Implements the internal **Buddy Allocator** (allocating $2^N$ byte pages) and **B-Tree** index.
-  * Writes exact Finder layout records:
-    * `Iloc`: (Icon Location) exact pixel coordinates `[x, y]` for the `.app` icon and the `/Applications` folder icon.
-    * `bwsp`: (Browser Window Settings Property list) window geometry bounds `[top, left, bottom, right]`, sidebar visibility, and toolbar status.
-    * `icvp`: (Icon View Properties) binary plist configuring icon size (e.g. 128px), text label size, label position (bottom vs right), and background image reference.
-    * `vstl`: (View Style) set to `icnv` (Icon View).
-* **`sla/` (Software License Agreements)**:
-  * Embeds multilingual license agreements into the disk image trailer (`LPic` resource dictionary). Displays an unavoidable agreement dialog to the user upon mounting.
+  * **512-Byte `koly` Trailer**: `.dmg` files are recognized by a 512-byte `koly` trailer at offset `EOF - 512`.
+  * Encodes header version 4, sector counts, XML partition plist (`<title> (Apple_HFS : 0)`), and chunk tables.
+  * **Chunk Descriptors (`blkx`)**: Generates compressed `UDZO` zlib Deflate chunks (`0x80000005`), raw data chunks (`0x00000001`), and ignored/sparse chunks (`0x00000002`).
+* **`hfs/` (HFS+ Filesystem)**:
+  * Constructs the `HFSPlusVolumeHeader` (`0x482B`), Allocation File bitmap, Extents Overflow B-Tree, and Catalog B-Tree containing the `.app` bundle and `/Applications` symlink.
+* **`dsstore/` (Finder Layout Presentation)**:
+  * Reverse-engineered implementation of Apple's `.DS_Store` binary Buddy Allocator and B-Tree.
+  * Encodes `Iloc` (icon coordinates), `bwsp` (window bounds), and `icvp` (icon size, background image reference).
 
 ---
 
-### 3. Flat & Distribution Installer Engine (`pkg/`)
+### 4. Flat Package Engine (`pkg/`)
 
-macOS Flat Packages are the official enterprise distribution format accepted by MDM systems (Jamf Pro, Munki, Microsoft Intune) and mandatory for Mac App Store submissions.
+macOS Flat Packages are the official enterprise installer format, supported by `installer`, Jamf Pro, Munki, and Microsoft Intune.
 
 * **`xar/` (Extensible Archive Container)**:
-  * Serializes the XAR container: 28-byte header (`magic = 0x78617221` / `xar!`), zlib-compressed XML Table of Contents (TOC) with SHA-256 hashes, and binary data heap.
-  * Embeds container-level RSA/ECDSA digital signatures into `<signature style="RSA">` in the TOC header.
+  * Serializes the 28-byte XAR header (`0x78617221`), zlib-compressed XML Table of Contents (TOC), and heap.
+  * Implements Apple's standard checksum layout: algorithm `1` (`SHA-1`), with the 20-byte SHA-1 digest of the compressed TOC placed at heap offset 0.
 * **`bom/` (Apple Bill of Materials)**:
-  * Native binary serializer for Apple's proprietary `BOMStore` format (magic `BOMStore\0`).
-  * Emits the BOM block table, `Paths` index, `File` records, and B-Tree nodes encoding file modes (`0755`, `0644`), UID/GID (0/80), sizes, checksums, and hardlink maps without relying on `mkbom`.
+  * Pure-Go generator for Apple's `BOMStore` format (magic `BOMStore\0`).
+  * Emits block tables, variable pointers (`BomInfo`, `Paths`, `HLIndex`, `VIndex`, `Size64`), and B-Tree leaf structures encoding file modes (`0755`, `0644`), UID/GID (`0/80`), sizes, and POSIX CRC-32 checksums. Verified against `/usr/bin/lsbom`.
 * **`cpio/` (Archive Payload Streaming)**:
-  * High-speed streaming SVR4 portable format archive (`070701` / `070702` with CRC) compressed with `gzip` or `xz`.
-  * Generates both `Payload` (installed files) and `Scripts` (`preinstall`, `postinstall`).
-* **`packageinfo/` & `distribution/` (XML Manifests)**:
-  * Generates component package `PackageInfo` manifests.
-  * Generates `Distribution` XML product definitions (`productbuild` equivalent) containing localization, welcome/license screens (HTML/RTF), hardware/OS requirements (`<os-version min="11.0"/>`), and volume checks.
+  * Implements POSIX odc (`070707`) 76-byte ASCII header format required by macOS `/usr/sbin/installer` and `pkgutil --expand-full`.
+  * Streams gzip-compressed `Payload` and `Scripts`.
+* **`packageinfo/` (PackageInfo XML)**:
+  * Generates `<pkg-info>` XML declarations with `format-version="2"`, install location, file counts, and installed size.
 
 ---
 
-### 4. Pure Go Code Signing Engine (`sign/`)
+### 5. Apple Notarization & Stapler (`notary/`)
 
-macOS Gatekeeper requires all binaries and bundles to be cryptographically signed with a trusted Apple Developer ID certificate.
-
-* **`macho/` (Mach-O Code Directory & SuperBlob)**:
-  * Serializes the `SuperBlob` structure (`CSMAGIC_EMBEDDED_SIGNATURE = 0xfade0cc0`) into the Mach-O binary's `LC_CODE_SIGNATURE` load command.
-  * Emits the `CS_CodeDirectory` blob (`version 0x20400` / `0x20500`) with SHA-256 code slot hashes computed for every 4096-byte page of the executable.
-  * Computes negative special slots:
-    * Slot -1: `Info.plist` SHA-256 hash
-    * Slot -2: Requirements blob (`CSMAGIC_REQUIREMENTS = 0xfade0c01`)
-    * Slot -3: `CodeResources` SHA-256 hash
-    * Slot -5: Entitlements XML blob (`CSMAGIC_EMBEDDED_ENTITLEMENTS = 0xfade0c05`)
-    * Slot -7: DER-encoded entitlements
-* **`coderesources/` (Resource Directory Tree Hashing)**:
-  * Generates `Contents/_CodeSignature/CodeResources` XML plist containing recursive SHA-1 and SHA-256 hashes of all resources, nested dynamic libraries, frameworks, and plugins.
-* **Hardened Runtime**:
-  * Sets the `CS_RUNTIME` bitflag (`0x10000`) in the CodeDirectory, enforcing Apple runtime integrity protections required for notarization.
-* **`cms/` (Cryptographic Message Syntax)**:
-  * Pure-Go RFC 5652 CMS / PKCS#7 detached signature generator. Signs code directory hashes using Apple Developer ID Application or Installer certificates.
-  * Embeds secure RFC 3161 trusted timestamp tokens from Apple's timestamp authority (`http://timestamp.apple.com/ts01`).
-
----
-
-### 5. Apple Notarization & Stapling Engine (`notary/`)
-
-All software distributed outside the Mac App Store must be notarized by Apple's automated notary service.
+Distributing software outside the Mac App Store requires notarization by Apple's automated service.
 
 * **`jwt/` (App Store Connect Authentication)**:
-  * Automatically signs and mints JSON Web Tokens using ECDSA ES256 private keys (`AuthKey_<KeyID>.p8`), Key IDs, and Issuer GUIDs.
+  * Automatically mints ES256 JSON Web Tokens using ECDSA P-256 private keys (`AuthKey_<KeyID>.p8`).
 * **`client/` (Notary REST API v2)**:
-  * Interacts with Apple's `https://appstoreconnect.apple.com/notary/v2` endpoints.
-  * Handles package submission, parallel S3 chunk uploads, polling submission status, and retrieving audit logs.
+  * Connects to `https://appstoreconnect.apple.com/notary/v2`.
+  * Manages package submission, parallel AWS S3 chunk uploads, polling status, and fetching audit logs.
 * **`staple/` (CloudKit Ticket Stapling)**:
-  * Fetches the base64-encoded notarization ticket issued by Apple.
-  * Injects the ticket directly into packages so Gatekeeper validates them offline:
-    * **In `.pkg`**: Inserted as an embedded XAR TOC leaf.
-    * **In `.dmg`**: Appended to the UDIF trailer as a signature resource (`kUDIFSignatureResource`).
-    * **In `.app`**: Written to `Contents/CodeResources` or the `com.apple.notary.ticket` extended attribute.
+  * Queries CloudKit for the issued notarization ticket.
+  * Injects the ticket directly into `.pkg`, `.dmg`, or `.app` for offline Gatekeeper validation.
 
 ---
 
-## Declarative Manifest Specification (`macpkg.yaml`)
+## Command-Line Interface (CLI)
 
-Define your entire macOS distribution pipeline in a single declarative manifest:
+### Installation
 
-```yaml
-# macpkg.yaml
-bundle:
-  name: "SuperApp"
-  identifier: "com.example.superapp"
-  version: "1.2.0"
-  build: "120"
-  executable: "bin/superapp-darwin-universal"
-  icon: "assets/icon.png"
-  category: "public.app-category.developer-tools"
-  min_os: "11.0"
-  entitlements: "build/entitlements.plist"
+```bash
+go install github.com/vertex-language/macpkg/cmd/macpkg@latest
+```
 
-sign:
-  cert_file: "certs/DeveloperIDApp.p12"
-  password: "${MACOS_CERT_PASSWORD}"
-  hardened_runtime: true
-  timestamp: true
+### CLI Commands & Examples
 
-targets:
-  - dmg:
-      output: "dist/SuperApp-1.2.0.dmg"
-      title: "SuperApp Installer"
-      background: "assets/dmg-background.png"
-      window_size: [640, 420]
-      icon_size: 128
-      app_position: [160, 210]
-      applications_symlink_position: [480, 210]
-      license: "LICENSE.txt"
+```bash
+macpkg v1.0.0 - Pure-Go macOS Packaging & Signing Toolchain
 
-  - pkg:
-      output: "dist/SuperApp-1.2.0.pkg"
-      identifier: "com.example.superapp.pkg"
-      install_location: "/Applications"
-      scripts: "scripts/" # preinstall, postinstall
-      signing_cert_file: "certs/DeveloperIDInstaller.p12"
-      signing_password: "${MACOS_INSTALLER_CERT_PASSWORD}"
+Usage:
+  macpkg <command> [subcommand] [flags]
 
-notary:
-  key_id: "2X9R4NN74K"
-  issuer_id: "57246542-96fe-1a63-e053-0824d011072a"
-  private_key: "certs/AuthKey_2X9R4NN74K.p8"
-  staple: true
+Commands:
+  app       Assemble macOS Application Bundles (.app)
+  dmg       Build Apple Disk Images (.dmg)
+  pkg       Compile macOS Flat Packages (.pkg)
+  sign      Code-sign Mach-O binaries and bundles
+  notary    Apple Notarization REST API v2 and stapler
+  staple    Staple notarization ticket to .app, .dmg, or .pkg
+  version   Print macpkg version
+  help      Display help information
+```
+
+#### 1. Assemble an Application Bundle
+```bash
+macpkg app build \
+  --name "MyApp" \
+  --id "com.example.myapp" \
+  --version "1.0.0" \
+  --bin ./bin/myapp \
+  --icon ./assets/AppIcon.icns \
+  --out dist/MyApp.app
+```
+
+#### 2. Sign Bundle with Hardened Runtime
+```bash
+# Ad-hoc signing (for local testing / development)
+macpkg sign --target dist/MyApp.app --identity "-" --hardened
+
+# Developer ID signing (for distribution)
+macpkg sign \
+  --target dist/MyApp.app \
+  --cert cert.pem \
+  --key key.pem \
+  --hardened \
+  --deep
+```
+
+#### 3. Build a Branded Disk Image (.dmg)
+```bash
+macpkg dmg build \
+  --title "MyApp Installer" \
+  --app dist/MyApp.app \
+  --out dist/MyApp.dmg \
+  --bg assets/dmg-bg.png \
+  --icon-size 128
+```
+
+#### 4. Compile a Flat Package (.pkg)
+```bash
+macpkg pkg build \
+  --id "com.example.myapp.pkg" \
+  --version "1.0.0" \
+  --location "/Applications" \
+  --payload dist/MyApp.app \
+  --out dist/MyApp.pkg
+```
+
+#### 5. Submit to Apple Notarization & Staple
+```bash
+# Submit and wait for completion
+macpkg notary submit dist/MyApp.dmg \
+  --issuer "57246542-96fe-1a63-e053-0824d011072a" \
+  --key-id "2X9R4NN74K" \
+  --key "AuthKey_2X9R4NN74K.p8" \
+  --wait
+
+# Staple ticket to artifact
+macpkg staple dist/MyApp.dmg
 ```
 
 ---
 
 ## Go Programmatic API
 
-`macpkg` uses **Config structs** throughout its programmatic API for type safety and clarity:
+`macpkg` follows Go standard library conventions, utilizing declarative **Config structs** rather than fluent builders.
 
-### 1. Assemble an `.app` Bundle
+### 1. Assembling a `.app` Bundle
 
 ```go
 package main
@@ -355,23 +314,60 @@ func main() {
     ctx := context.Background()
 
     bundle, err := app.Assemble(ctx, app.Config{
-        Name:       "SuperApp",
-        Identifier: "com.example.superapp",
-        Version:    "1.2.0",
-        Executable: "bin/superapp",
-        Icon:       "assets/icon.png",
-        MinOS:      "11.0",
-        OutDir:     "dist/SuperApp.app",
-        FS:         vfs.RealFS(""),
+        Name:         "SuperApp",
+        Identifier:   "com.example.superapp",
+        Version:      "1.0.0",
+        Build:        "1",
+        SourceBinary: "bin/superapp",
+        SourceIcon:   "assets/AppIcon.icns",
+        Category:     "public.app-category.developer-tools",
+        MinOS:        "11.0",
+        OutDir:       "dist/SuperApp.app",
+        FS:           vfs.RealFS(""),
     })
     if err != nil {
-        log.Fatal(err)
+        log.Fatalf("Assemble failed: %v", err)
     }
-    log.Printf("Built bundle at %s (%d bytes)", bundle.Path, bundle.TotalSize)
+
+    log.Printf("Successfully assembled %s (%d files, %d bytes)",
+        bundle.Path, len(bundle.Files), bundle.TotalSize)
 }
 ```
 
-### 2. Build a Branded `.dmg` Disk Image
+### 2. Code Signing with Hardened Runtime
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+
+    "github.com/vertex-language/macpkg/sign"
+    "github.com/vertex-language/macpkg/vfs"
+)
+
+func main() {
+    ctx := context.Background()
+
+    res, err := sign.Sign(ctx, sign.Config{
+        Target:   "dist/SuperApp.app",
+        Identity: "-", // Ad-hoc signing (or pass CertPath/KeyPath)
+        Hardened: true,
+        Deep:     true,
+        Force:    true,
+        FS:       vfs.RealFS(""),
+    })
+    if err != nil {
+        log.Fatalf("Signing failed: %v", err)
+    }
+
+    log.Printf("Signed %s (Identifier: %s, Format: %s)",
+        res.Target, res.Identifier, res.Format)
+}
+```
+
+### 3. Building a Branded `.dmg` Disk Image
 
 ```go
 package main
@@ -390,23 +386,24 @@ func main() {
     res, err := dmg.Build(ctx, dmg.Config{
         Title:                "SuperApp Installer",
         SourceApp:            "dist/SuperApp.app",
-        OutFile:              "dist/SuperApp-1.2.0.dmg",
-        Background:           "assets/dmg-background.png",
-        WindowSize:           dmg.Size{Width: 640, Height: 420},
+        OutFile:              "dist/SuperApp.dmg",
+        Background:           "assets/dmg-bg.png",
         IconSize:             128,
-        AppPosition:          dmg.Point{X: 160, Y: 210},
-        ApplicationsPosition: dmg.Point{X: 480, Y: 210},
         AddApplicationsLink:  true,
+        WindowSize:           dmg.Size{Width: 640, Height: 480},
+        AppPosition:          dmg.Point{X: 180, Y: 240},
+        ApplicationsPosition: dmg.Point{X: 460, Y: 240},
         FS:                   vfs.RealFS(""),
     })
     if err != nil {
-        log.Fatal(err)
+        log.Fatalf("DMG build failed: %v", err)
     }
+
     log.Printf("Built DMG: %s (%d bytes)", res.OutputFile, res.TotalSize)
 }
 ```
 
-### 3. Build an Enterprise `.pkg` Installer
+### 4. Compiling a Flat `.pkg` Installer
 
 ```go
 package main
@@ -424,51 +421,102 @@ func main() {
 
     res, err := pkg.Build(ctx, pkg.Config{
         Identifier:      "com.example.superapp.pkg",
-        Version:         "1.2.0",
+        Version:         "1.0.0",
         InstallLocation: "/Applications",
         SourcePayload:   "dist/SuperApp.app",
-        OutFile:         "dist/SuperApp-1.2.0.pkg",
-        ScriptsDir:      "scripts",
+        OutFile:         "dist/SuperApp.pkg",
         FS:              vfs.RealFS(""),
     })
     if err != nil {
-        log.Fatal(err)
+        log.Fatalf("PKG build failed: %v", err)
     }
-    log.Printf("Built PKG: %s (%d bytes)", res.OutputFile, res.TotalSize)
+
+    log.Printf("Built PKG: %s (%d files, %d bytes)",
+        res.OutputFile, res.FilesCount, res.TotalSize)
+}
+```
+
+### 5. Unified Pipeline with `macpkg.Build`
+
+Orchestrate the entire pipeline using the top-level facade:
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+
+    "github.com/vertex-language/macpkg"
+    "github.com/vertex-language/macpkg/app"
+    "github.com/vertex-language/macpkg/sign"
+)
+
+func main() {
+    ctx := context.Background()
+
+    res, err := macpkg.Build(ctx, macpkg.Config{
+        Format: macpkg.FormatApp,
+        App: &app.Config{
+            Name:         "SuperApp",
+            Identifier:   "com.example.superapp",
+            SourceBinary: "bin/superapp",
+            OutDir:       "dist/SuperApp.app",
+        },
+        Sign: &sign.Config{
+            Identity: "-",
+            Hardened: true,
+        },
+    })
+    if err != nil {
+        log.Fatalf("Pipeline failed: %v", err)
+    }
+
+    log.Printf("Completed %s build: %s", res.Format, res.Artifact)
 }
 ```
 
 ---
 
-## Command-Line Interface (CLI)
+## Hermetic & In-Memory Builds (`vfs.MemFS`)
 
-```bash
-# Build all targets defined in macpkg.yaml
-macpkg build [macpkg.yaml]
+Every packaging engine in `macpkg` accepts a pluggable virtual filesystem (`vfs.FS`). This allows complete pipelines to execute in memory without disk I/O, perfect for unit tests and deterministic CI builds:
 
-# Format-specific commands
-macpkg app assemble -c app.yaml -o dist/MyApp.app
-macpkg dmg pack dist/MyApp.app -o dist/MyApp.dmg --background bg.png
-macpkg pkg pack dist/MyApp.app -o dist/MyApp.pkg --install-location /Applications
+```go
+mem := vfs.NewMemFS()
 
-# Security & Verification
-macpkg sign dist/MyApp.app --cert cert.p12 --entitlements entitlements.plist
-macpkg notary submit dist/MyApp.dmg --key-id $KEYID --issuer-id $ISSUER --key auth.p8 --staple
-macpkg inspect dist/MyApp.dmg
-macpkg verify dist/MyApp.pkg
+// Assemble bundle entirely in memory
+bundle, err := app.Assemble(ctx, app.Config{
+    Name:           "InMemoryApp",
+    Identifier:     "com.example.inmemory",
+    Executable:     "app",
+    ExecutableData: []byte("RAW MACH-O DATA"),
+    FS:             mem,
+})
+
+// Read the generated Info.plist directly from memory
+plistData, _ := mem.ReadFile("InMemoryApp.app/Contents/Info.plist")
 ```
 
 ---
 
-## Shared Infrastructure with `winpkg`
+## Shared Architecture with `winpkg`
 
-`macpkg` shares core engineering primitives with [`github.com/vertex-language/winpkg`](https://github.com/vertex-language/winpkg):
-* **`vfs.FS`**: Pluggable filesystem interface (`RealFS` for OS operations, `MemFS` for zero-disk-I/O in-memory testing).
-* **`run.Runner`**: Process execution seaming and recording mocks for testing.
-* **Declarative Workflow**: Unified manifest patterns across Windows (`winpkg`) and macOS (`macpkg`).
+`macpkg` shares design principles and architectural patterns with [`github.com/vertex-language/winpkg`](https://github.com/vertex-language/winpkg):
+
+| Capability | `winpkg` (Windows) | `macpkg` (macOS) |
+|---|---|---|
+| **Zero Cgo / Host Tools** | No `msi.dll`, `signtool.exe`, `wix.exe` | No `codesign`, `hdiutil`, `pkgbuild` |
+| **Pluggable Virtual FS** | `vfs.FS` (`RealFS` & `MemFS`) | `vfs.FS` (`RealFS` & `MemFS`) |
+| **API Pattern** | `Config` structs with zero-defaults | `Config` structs with zero-defaults |
+| **App Bundle Format** | MSIX Package (`msix.Build`) | macOS App Bundle (`app.Assemble`) |
+| **Installer Format** | Windows Installer MSI (`msi.Build`) | Flat Package PKG (`pkg.Build`) |
+| **Disk Image Format** | - | Apple UDZO DMG (`dmg.Build`) |
+| **Code Signing** | Authenticode PKCS#7 (`sign.Sign`) | Mach-O LC_CODE_SIGNATURE (`sign.Sign`) |
+| **Cloud Service** | Windows Store / Azure | Apple Notarization REST API v2 (`notary`) |
 
 ---
 
 ## License
 
-MIT
+MIT License. See [LICENSE](LICENSE) for details.
