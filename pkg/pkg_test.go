@@ -80,7 +80,16 @@ func TestBuild_MemFS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cpio.ExtractGz(Payload): %v", err)
 	}
-	if len(cpioEntries) != 3 {
-		t.Errorf("expected 3 cpio entries in Payload, got %d", len(cpioEntries))
+
+	foundEntries := make(map[string]bool)
+	for _, e := range cpioEntries {
+		foundEntries[e.Name] = true
+	}
+
+	for p := range payloadFiles {
+		expectedPath := "./" + p
+		if !foundEntries[expectedPath] {
+			t.Errorf("expected %s in Payload cpio entries", expectedPath)
+		}
 	}
 }

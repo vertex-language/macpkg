@@ -12,6 +12,73 @@ import (
 	"github.com/vertex-language/macpkg/vfs"
 )
 
+// DefaultRules returns the standard macOS rules and rules2 dictionaries for CodeResources.
+func DefaultRules() (map[string]any, map[string]any) {
+	rules := map[string]any{
+		"^Resources/": true,
+		"^Resources/.*\\.lproj/": map[string]any{
+			"optional": true,
+			"weight":   1000.0,
+		},
+		"^Resources/.*\\.lproj/locversion.plist$": map[string]any{
+			"omit":   true,
+			"weight": 1100.0,
+		},
+		"^Resources/Base\\.lproj/": map[string]any{
+			"weight": 1010.0,
+		},
+		"^version.plist$": true,
+	}
+
+	rules2 := map[string]any{
+		".*\\.dSYM($|/)": map[string]any{
+			"weight": 11.0,
+		},
+		"^(.*/)?\\.DS_Store$": map[string]any{
+			"omit":   true,
+			"weight": 2000.0,
+		},
+		"^(Frameworks|SharedFrameworks|PlugIns|Plug-ins|XPCServices|Helpers|MacOS|Library/(Automator|Spotlight|LoginItems))/": map[string]any{
+			"nested": true,
+			"weight": 10.0,
+		},
+		"^.*": true,
+		"^Info\\.plist$": map[string]any{
+			"omit":   true,
+			"weight": 20.0,
+		},
+		"^PkgInfo$": map[string]any{
+			"omit":   true,
+			"weight": 20.0,
+		},
+		"^Resources/": map[string]any{
+			"weight": 20.0,
+		},
+		"^Resources/.*\\.lproj/": map[string]any{
+			"optional": true,
+			"weight":   1000.0,
+		},
+		"^Resources/.*\\.lproj/locversion.plist$": map[string]any{
+			"omit":   true,
+			"weight": 1100.0,
+		},
+		"^Resources/Base\\.lproj/": map[string]any{
+			"weight": 1010.0,
+		},
+		"^[^/]+$": map[string]any{
+			"nested": true,
+			"weight": 10.0,
+		},
+		"^embedded\\.provisionprofile$": map[string]any{
+			"weight": 20.0,
+		},
+		"^version\\.plist$": map[string]any{
+			"weight": 20.0,
+		},
+	}
+	return rules, rules2
+}
+
 // Generate scans a bundle's Contents/ directory and generates CodeResources XML plist bytes.
 func Generate(bundleContentsDir string, fsys vfs.FS) ([]byte, error) {
 	if fsys == nil {
@@ -31,8 +98,9 @@ func Generate(bundleContentsDir string, fsys vfs.FS) ([]byte, error) {
 
 		rel := strings.TrimPrefix(p, bundleContentsDir)
 		rel = strings.TrimPrefix(rel, "/")
-		// Never hash _CodeSignature itself
-		if strings.HasPrefix(rel, "_CodeSignature") {
+
+		// Omit _CodeSignature, Info.plist, PkgInfo, and executables in MacOS/ (bound by CodeDirectory)
+		if strings.HasPrefix(rel, "_CodeSignature") || rel == "Info.plist" || rel == "PkgInfo" || strings.HasPrefix(rel, "MacOS/") {
 			return nil
 		}
 
@@ -56,15 +124,12 @@ func Generate(bundleContentsDir string, fsys vfs.FS) ([]byte, error) {
 		return nil, fmt.Errorf("scan bundle resources: %w", err)
 	}
 
+	rules, rules2 := DefaultRules()
 	doc := map[string]any{
 		"files":  filesMap,
 		"files2": files2Map,
-		"rules": map[string]any{
-			"^.*": true,
-		},
-		"rules2": map[string]any{
-			"^.*": true,
-		},
+		"rules":  rules,
+		"rules2": rules2,
 	}
 
 	return plist.MarshalXML(doc)

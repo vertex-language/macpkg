@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"compress/zlib"
 	"crypto/rand"
-	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
@@ -57,37 +56,53 @@ func CompressUDIF(raw []byte, volumeName string) ([]byte, error) {
 		endByte := startByte + sectorsInChunk*SectorSize
 		chunkData := paddedRaw[startByte:endByte]
 
-		// Try compressing with zlib
-		var zbuf bytes.Buffer
-		zw := zlib.NewWriter(&zbuf)
-		_, _ = zw.Write(chunkData)
-		_ = zw.Close()
+		// Check if chunk is all zeros
+		allZero := true
+		for _, b := range chunkData {
+			if b != 0 {
+				allZero = false
+				break
+			}
+		}
 
-		compBytes := zbuf.Bytes()
 		offset := uint64(dataFork.Len())
-
-		if len(compBytes) < len(chunkData) {
-			// Compressed chunk
-			dataFork.Write(compBytes)
+		if allZero {
 			chunks = append(chunks, Chunk{
-				Type:             TypeUDZO,
+				Type:             TypeIgnored,
 				Comment:          0,
 				SectorNumber:     curSector,
 				SectorCount:      sectorsInChunk,
 				CompressedOffset: offset,
-				CompressedLength: uint64(len(compBytes)),
+				CompressedLength: 0,
 			})
 		} else {
-			// Raw chunk
-			dataFork.Write(chunkData)
-			chunks = append(chunks, Chunk{
-				Type:             TypeRaw,
-				Comment:          0,
-				SectorNumber:     curSector,
-				SectorCount:      sectorsInChunk,
-				CompressedOffset: offset,
-				CompressedLength: uint64(len(chunkData)),
-			})
+			var zbuf bytes.Buffer
+			zw := zlib.NewWriter(&zbuf)
+			_, _ = zw.Write(chunkData)
+			_ = zw.Close()
+			compBytes := zbuf.Bytes()
+
+			if len(compBytes) < len(chunkData) {
+				dataFork.Write(compBytes)
+				chunks = append(chunks, Chunk{
+					Type:             TypeUDZO,
+					Comment:          0,
+					SectorNumber:     curSector,
+					SectorCount:      sectorsInChunk,
+					CompressedOffset: offset,
+					CompressedLength: uint64(len(compBytes)),
+				})
+			} else {
+				dataFork.Write(chunkData)
+				chunks = append(chunks, Chunk{
+					Type:             TypeRaw,
+					Comment:          0,
+					SectorNumber:     curSector,
+					SectorCount:      sectorsInChunk,
+					CompressedOffset: offset,
+					CompressedLength: uint64(len(chunkData)),
+				})
+			}
 		}
 
 		curSector += sectorsInChunk
@@ -120,7 +135,7 @@ func CompressUDIF(raw []byte, volumeName string) ([]byte, error) {
 	xmlLength := uint64(len(xmlPlist))
 
 	// Build 512-byte koly trailer
-	kolyBlock, err := buildKolyTrailer(uint64(dataFork.Len()), xmlOffset, xmlLength, totalSectors, dataFork.Bytes())
+	kolyBlock, err := buildKolyTrailer(uint64(dataFork.Len()), xmlOffset, xmlLength, totalSectors)
 	if err != nil {
 		return nil, fmt.Errorf("build koly trailer: %w", err)
 	}
@@ -137,10 +152,10 @@ func buildMishBlock(totalSectors uint64, chunks []Chunk) ([]byte, error) {
 	_ = binary.Write(&buf, binary.BigEndian, uint32(1)) // Version 1
 	_ = binary.Write(&buf, binary.BigEndian, uint64(0)) // SectorNumber
 	_ = binary.Write(&buf, binary.BigEndian, totalSectors)
-	_ = binary.Write(&buf, binary.BigEndian, uint64(0))  // DataOffset
-	_ = binary.Write(&buf, binary.BigEndian, uint32(0))  // BuffersNeeded
-	_ = binary.Write(&buf, binary.BigEndian, uint32(0))  // BlockDescriptors
-	buf.Write(make([]byte, 24))                          // Reserved 24 bytes
+	_ = binary.Write(&buf, binary.BigEndian, uint64(0))          // DataOffset
+	_ = binary.Write(&buf, binary.BigEndian, uint32(2056))       // BuffersNeeded
+	_ = binary.Write(&buf, binary.BigEndian, uint32(0xfffffffe)) // BlockDescriptors
+	buf.Write(make([]byte, 24))                                  // Reserved 24 bytes
 
 	// Checksum (136 bytes: type uint32, size uint32, data 128 bytes)
 	_ = binary.Write(&buf, binary.BigEndian, uint32(0))
@@ -165,9 +180,11 @@ func buildMishBlock(totalSectors uint64, chunks []Chunk) ([]byte, error) {
 
 func buildXMLPlist(mishData []byte, volumeName string) string {
 	b64Mish := base64.StdEncoding.EncodeToString(mishData)
+	dummyPlst := base64.StdEncoding.EncodeToString(make([]byte, 512))
 	if volumeName == "" {
-		volumeName = "Disk Image"
+		volumeName = "whole disk"
 	}
+	partName := fmt.Sprintf("%s (Apple_HFS : 0)", volumeName)
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -178,22 +195,35 @@ func buildXMLPlist(mishData []byte, volumeName string) string {
 		<array>
 			<dict>
 				<key>Attributes</key>
-				<string>0x00000000</string>
+				<string>0x0050</string>
 				<key>Data</key>
 				<data>%s</data>
 				<key>ID</key>
-				<string>-1</string>
+				<string>0</string>
 				<key>Name</key>
 				<string>%s</string>
+			</dict>
+		</array>
+		<key>plst</key>
+		<array>
+			<dict>
+				<key>Attributes</key>
+				<string>0x0050</string>
+				<key>Data</key>
+				<data>%s</data>
+				<key>ID</key>
+				<string>0</string>
+				<key>Name</key>
+				<string></string>
 			</dict>
 		</array>
 	</dict>
 </dict>
 </plist>
-`, b64Mish, volumeName)
+`, b64Mish, partName, dummyPlst)
 }
 
-func buildKolyTrailer(dataForkLen, xmlOffset, xmlLength, totalSectors uint64, dataFork []byte) ([]byte, error) {
+func buildKolyTrailer(dataForkLen, xmlOffset, xmlLength, totalSectors uint64) ([]byte, error) {
 	buf := make([]byte, 512)
 
 	// Magic
@@ -219,23 +249,20 @@ func buildKolyTrailer(dataForkLen, xmlOffset, xmlLength, totalSectors uint64, da
 	// SegmentID (16 bytes random)
 	_, _ = io.ReadFull(rand.Reader, buf[64:80])
 
-	// DataForkChecksum (SHA-1)
-	sha := sha1.Sum(dataFork)
-	binary.BigEndian.PutUint32(buf[80:84], 2) // 2 = CRC or SHA-1
-	binary.BigEndian.PutUint32(buf[84:88], uint32(len(sha)*8))
-	copy(buf[88:88+len(sha)], sha[:])
+	// DataForkChecksum (0 = None)
+	binary.BigEndian.PutUint32(buf[80:84], 0)
+	binary.BigEndian.PutUint32(buf[84:88], 0)
 
 	// XMLOffset & XMLLength
 	binary.BigEndian.PutUint64(buf[216:224], xmlOffset)
 	binary.BigEndian.PutUint64(buf[224:232], xmlLength)
 
-	// Master Checksum
-	binary.BigEndian.PutUint32(buf[352:356], 2)
-	binary.BigEndian.PutUint32(buf[356:360], uint32(len(sha)*8))
-	copy(buf[360:360+len(sha)], sha[:])
+	// Master Checksum (0 = None)
+	binary.BigEndian.PutUint32(buf[352:356], 0)
+	binary.BigEndian.PutUint32(buf[356:360], 0)
 
-	// ImageVariant 1
-	binary.BigEndian.PutUint32(buf[488:492], 1)
+	// ImageVariant 2 = UDZO
+	binary.BigEndian.PutUint32(buf[488:492], 2)
 	// SectorCount
 	binary.BigEndian.PutUint64(buf[492:500], totalSectors)
 

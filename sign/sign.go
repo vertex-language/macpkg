@@ -194,13 +194,17 @@ func signBundle(ctx context.Context, cfg Config, fsys vfs.FS, id *macho.Identity
 	if err := coderesources.SealBundle(cfg.Target, fsys); err != nil {
 		return nil, fmt.Errorf("sign: seal bundle: %w", err)
 	}
-	res.SignedList = append(res.SignedList, path.Join(contentsDir, "_CodeSignature", "CodeResources"))
+	codeResourcesPath := path.Join(contentsDir, "_CodeSignature", "CodeResources")
+	codeResourcesBytes, _ := fsys.ReadFile(codeResourcesPath)
+	res.SignedList = append(res.SignedList, codeResourcesPath)
 
 	// 3. Inspect Info.plist
 	infoPlistPath := path.Join(contentsDir, "Info.plist")
 	var execName string
 	var bundleIdent string
+	var infoPlistBytes []byte
 	if plistData, err := fsys.ReadFile(infoPlistPath); err == nil {
+		infoPlistBytes = plistData
 		if val, ok := plist.Lookup(plistData, "CFBundleExecutable"); ok {
 			execName = fmt.Sprint(val)
 		}
@@ -243,6 +247,8 @@ func signBundle(ctx context.Context, cfg Config, fsys vfs.FS, id *macho.Identity
 				Force:        true,
 				Hardened:     cfg.Hardened,
 				Entitlements: entitlements,
+				InfoPlist:    infoPlistBytes,
+				ResourceDir:  codeResourcesBytes,
 			}
 
 			signed, err := macho.SignImage(binData, signOpts)

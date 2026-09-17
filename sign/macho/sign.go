@@ -26,6 +26,8 @@ type Options struct {
 	Force        bool      // overwrite an existing signature (codesign -f)
 	Hardened     bool      // set CS_RUNTIME
 	Entitlements []byte    // raw XML entitlements plist (optional)
+	InfoPlist    []byte    // raw Info.plist bytes (special slot -1)
+	ResourceDir  []byte    // raw CodeResources bytes (special slot -3)
 	HashType     uint8     // 0 => SHA-256
 	Logger       *Logger   // nil => silent at all levels
 }
@@ -180,10 +182,18 @@ func signSlice(s *Slice, opts Options) error {
 	l.V2("  execSegFlags:   0x%016x  (%s)", execFlags, execSegFlagsStr(execFlags))
 	l.V2("  isMainBinary:   %v", s.isMain)
 
-	// ── Requirements ──────────────────────────────────────────────────────────
+	// ── Info.plist (slot -1) ──────────────────────────────────────────────────
 	special := map[int][]byte{}
 	var components []blob
 
+	if len(opts.InfoPlist) > 0 {
+		infoHash := hashBlob(opts.InfoPlist, ht)
+		special[1] = infoHash
+		l.V2("  info.plist:     %d bytes  (special slot -1)", len(opts.InfoPlist))
+		l.V3("    hash:         %s", hex.EncodeToString(infoHash))
+	}
+
+	// ── Requirements (slot -2) ───────────────────────────────────────────────
 	var reqs []byte
 	if opts.Identity != nil {
 		reqs = designatedRequirement(opts.Identifier)
@@ -196,7 +206,15 @@ func signSlice(s *Slice, opts Options) error {
 	l.V2("  requirements:   %d bytes  (special slot -2)", len(reqs))
 	l.V3("    hash:         %s", hex.EncodeToString(reqHash))
 
-	// ── Entitlements ──────────────────────────────────────────────────────────
+	// ── ResourceDir (slot -3) ────────────────────────────────────────────────
+	if len(opts.ResourceDir) > 0 {
+		resHash := hashBlob(opts.ResourceDir, ht)
+		special[3] = resHash
+		l.V2("  resourceDir:    %d bytes  (special slot -3)", len(opts.ResourceDir))
+		l.V3("    hash:         %s", hex.EncodeToString(resHash))
+	}
+
+	// ── Entitlements (slot -5) ────────────────────────────────────────────────
 	if len(opts.Entitlements) > 0 {
 		ent := xmlEntitlements(opts.Entitlements)
 		entHash := hashBlob(ent, ht)

@@ -3,7 +3,7 @@ package xar
 import (
 	"bytes"
 	"compress/zlib"
-	"crypto/sha256"
+	"crypto/sha1"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/xml"
@@ -18,7 +18,8 @@ const (
 	Magic             = uint32(0x78617221) // "xar!"
 	HeaderSize        = uint16(28)
 	Version           = uint16(1)
-	ChecksumAlgorithm = uint32(2) // 2 = SHA-256
+	ChecksumAlgorithm = uint32(1)  // 1 = SHA-1 (Apple standard for macOS flat .pkg)
+	ChecksumSize      = uint64(20) // SHA-1 digest size in bytes
 )
 
 // FileEntry represents a file in the XAR archive.
@@ -29,20 +30,20 @@ type FileEntry struct {
 
 // TOC represents the XAR XML Table of Contents.
 type TOC struct {
-	XMLName      xml.Name  `xml:"xar"`
-	TOC          TOCInner  `xml:"toc"`
+	XMLName xml.Name `xml:"xar"`
+	TOC     TOCInner `xml:"toc"`
 }
 
 type TOCInner struct {
-	CreationDate string    `xml:"creation-time"`
 	Checksum     Checksum  `xml:"checksum"`
+	CreationDate string    `xml:"creation-time,omitempty"`
 	Files        []TOCFile `xml:"file"`
 }
 
 type Checksum struct {
 	Style  string `xml:"style,attr"`
-	Offset uint64 `xml:"offset"`
 	Size   uint64 `xml:"size"`
+	Offset uint64 `xml:"offset"`
 }
 
 type TOCFile struct {
@@ -53,12 +54,12 @@ type TOCFile struct {
 }
 
 type TOCData struct {
-	Length            uint64 `xml:"length"`
-	Offset            uint64 `xml:"offset"`
-	Size              uint64 `xml:"size"`
-	Encoding          *TOCEncoding `xml:"encoding,omitempty"`
 	ArchivedChecksum  ChecksumStyle `xml:"archived-checksum"`
 	ExtractedChecksum ChecksumStyle `xml:"extracted-checksum"`
+	Size              uint64        `xml:"size"`
+	Offset            uint64        `xml:"offset"`
+	Encoding          TOCEncoding   `xml:"encoding"`
+	Length            uint64        `xml:"length"`
 }
 
 type TOCEncoding struct {
@@ -75,31 +76,36 @@ func Archive(files []FileEntry) ([]byte, error) {
 	var heap bytes.Buffer
 	var tocFiles []TOCFile
 
+	// Heap offset 0..ChecksumSize is reserved for the compressed-TOC checksum.
+	// File data starts at offset ChecksumSize (20 bytes for SHA-1).
 	for i, f := range files {
 		uncompressedSize := uint64(len(f.Data))
-		extractedHash := sha256.Sum256(f.Data)
+		fileHash := sha1.Sum(f.Data)
+		hashHex := hex.EncodeToString(fileHash[:])
 
-		offset := uint64(heap.Len())
+		offset := ChecksumSize + uint64(heap.Len())
 		heap.Write(f.Data)
 		archivedSize := uint64(len(f.Data))
-		archivedHash := sha256.Sum256(f.Data)
 
 		tocFiles = append(tocFiles, TOCFile{
 			ID:   fmt.Sprintf("%d", i+1),
 			Name: f.Name,
 			Type: "file",
 			Data: TOCData{
-				Length: archivedSize,
-				Offset: offset,
-				Size:   uncompressedSize,
 				ArchivedChecksum: ChecksumStyle{
-					Style: "sha256",
-					Value: hex.EncodeToString(archivedHash[:]),
+					Style: "sha1",
+					Value: hashHex,
 				},
 				ExtractedChecksum: ChecksumStyle{
-					Style: "sha256",
-					Value: hex.EncodeToString(extractedHash[:]),
+					Style: "sha1",
+					Value: hashHex,
 				},
+				Size:   uncompressedSize,
+				Offset: offset,
+				Encoding: TOCEncoding{
+					Style: "application/octet-stream",
+				},
+				Length: archivedSize,
 			},
 		})
 	}
@@ -107,22 +113,23 @@ func Archive(files []FileEntry) ([]byte, error) {
 	// Prepare XML TOC
 	tocObj := TOC{
 		TOC: TOCInner{
-			CreationDate: time.Now().UTC().Format(time.RFC3339),
 			Checksum: Checksum{
-				Style:  "sha256",
+				Style:  "sha1",
+				Size:   ChecksumSize,
 				Offset: 0,
-				Size:   32,
 			},
-			Files: tocFiles,
+			CreationDate: time.Now().UTC().Format("2006-01-02T15:04:05Z"),
+			Files:        tocFiles,
 		},
 	}
 
-	xmlBytes, err := xml.MarshalIndent(tocObj, "", "  ")
+	xmlBytes, err := xml.MarshalIndent(tocObj, "", " ")
 	if err != nil {
 		return nil, fmt.Errorf("marshal TOC XML: %w", err)
 	}
 	xmlHeader := []byte("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
 	uncompressedTOC := append(xmlHeader, xmlBytes...)
+	uncompressedTOC = append(uncompressedTOC, '\n')
 	uncompressedLen := uint64(len(uncompressedTOC))
 
 	// Compress TOC with zlib
@@ -136,6 +143,9 @@ func Archive(files []FileEntry) ([]byte, error) {
 	}
 	compressedLen := uint64(compressedTOC.Len())
 
+	// Compute checksum of compressed TOC
+	tocChecksum := sha1.Sum(compressedTOC.Bytes())
+
 	// Build 28-byte Header
 	var out bytes.Buffer
 	_ = binary.Write(&out, binary.BigEndian, Magic)
@@ -145,8 +155,9 @@ func Archive(files []FileEntry) ([]byte, error) {
 	_ = binary.Write(&out, binary.BigEndian, uncompressedLen)
 	_ = binary.Write(&out, binary.BigEndian, ChecksumAlgorithm)
 
-	// Append compressed TOC + Heap
+	// Append compressed TOC + Heap (TOC checksum + file data)
 	out.Write(compressedTOC.Bytes())
+	out.Write(tocChecksum[:])
 	out.Write(heap.Bytes())
 
 	return out.Bytes(), nil
@@ -154,7 +165,7 @@ func Archive(files []FileEntry) ([]byte, error) {
 
 // Extract extracts files from a XAR archive stream.
 func Extract(data []byte) (map[string][]byte, error) {
-	if len(data) < 28 {
+	if len(data) < int(HeaderSize) {
 		return nil, errors.New("data too short for XAR header")
 	}
 
@@ -196,7 +207,7 @@ func Extract(data []byte) (map[string][]byte, error) {
 		start := int(f.Data.Offset)
 		end := start + int(f.Data.Length)
 		if end > len(heap) {
-			return nil, fmt.Errorf("file %s heap bounds overflow", f.Name)
+			return nil, fmt.Errorf("file %s heap bounds overflow (offset=%d len=%d heap=%d)", f.Name, start, f.Data.Length, len(heap))
 		}
 		result[f.Name] = heap[start:end]
 	}

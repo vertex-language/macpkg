@@ -7,14 +7,17 @@ import (
 
 // Info defines the PackageInfo structure for macOS flat packages.
 type Info struct {
-	XMLName         xml.Name `xml:"pkg-info"`
-	FormatVersion   string   `xml:"format-version,attr"`
-	Identifier      string   `xml:"identifier,attr"`
-	Version         string   `xml:"version,attr"`
-	InstallLocation string   `xml:"install-location,attr"`
-	Auth            string   `xml:"auth,attr,omitempty"` // "root" or empty
-	Payload         Payload  `xml:"payload"`
-	Bundle          *Bundle  `xml:"bundle,omitempty"`
+	XMLName              xml.Name `xml:"pkg-info"`
+	FormatVersion        string   `xml:"format-version,attr"`
+	Identifier           string   `xml:"identifier,attr"`
+	Version              string   `xml:"version,attr"`
+	InstallLocation      string   `xml:"install-location,attr"`
+	Auth                 string   `xml:"auth,attr,omitempty"` // "root" or empty
+	OverwritePermissions string   `xml:"overwrite-permissions,attr,omitempty"`
+	Relocatable          string   `xml:"relocatable,attr,omitempty"`
+	PostinstallAction    string   `xml:"postinstall-action,attr,omitempty"`
+	Payload              Payload  `xml:"payload"`
+	Bundle               *Bundle  `xml:"bundle,omitempty"`
 }
 
 type Payload struct {
@@ -39,6 +42,15 @@ func Generate(info Info) ([]byte, error) {
 	}
 	if info.InstallLocation == "" {
 		info.InstallLocation = "/Applications"
+	}
+	if info.OverwritePermissions == "" {
+		info.OverwritePermissions = "true"
+	}
+	if info.Relocatable == "" {
+		info.Relocatable = "false"
+	}
+	if info.PostinstallAction == "" {
+		info.PostinstallAction = "none"
 	}
 
 	xmlBytes, err := xml.MarshalIndent(info, "", "  ")

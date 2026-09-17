@@ -7,8 +7,11 @@ import (
 	"io"
 )
 
-// Magic is the 6-byte SVR4 portable cpio new ASCII format identifier.
-const Magic = "070701"
+// Magic is the 6-byte POSIX odc (old character) format identifier used by macOS installer packages.
+const Magic = "070707"
+
+// MagicNewASCII is the 6-byte SVR4 portable cpio format identifier.
+const MagicNewASCII = "070701"
 
 // FileEntry represents a file or directory in a cpio stream.
 type FileEntry struct {
@@ -19,7 +22,7 @@ type FileEntry struct {
 	Data []byte
 }
 
-// Archive builds an uncompressed cpio archive stream.
+// Archive builds an uncompressed odc cpio archive stream (macOS standard).
 func Archive(files []FileEntry) ([]byte, error) {
 	var buf bytes.Buffer
 
@@ -34,7 +37,7 @@ func Archive(files []FileEntry) ([]byte, error) {
 		Name: "TRAILER!!!",
 		Mode: 0,
 	}
-	if err := writeFileEntry(&buf, 0, trailer); err != nil {
+	if err := writeFileEntry(&buf, uint32(len(files)+1), trailer); err != nil {
 		return nil, err
 	}
 
@@ -69,41 +72,35 @@ func writeFileEntry(w *bytes.Buffer, ino uint32, f FileEntry) error {
 	namesize := uint32(len(nameWithNull))
 	filesize := uint32(len(f.Data))
 
-	// 110-byte ASCII header
+	nlink := uint32(1)
+	if f.Mode&0040000 != 0 {
+		nlink = 2
+	}
+
+	// 76-byte ASCII header for POSIX odc format:
+	// dev(6), ino(6), mode(6), uid(6), gid(6), nlink(6), rdev(6), mtime(11), namesize(6), filesize(11)
 	header := fmt.Sprintf(
-		"%s%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x",
-		Magic,
+		"070707%06o%06o%06o%06o%06o%06o%06o%011o%06o%011o",
+		0,
 		ino,
 		f.Mode,
 		f.UID,
 		f.GID,
-		1, // nlink
-		1600000000, // mtime
-		filesize,
-		0, 0, 0, 0, // dev major/minor, rdev major/minor
+		nlink,
+		0,
+		0,
 		namesize,
-		0, // check
+		filesize,
 	)
 
-	if len(header) != 110 {
-		return fmt.Errorf("unexpected header length: %d", len(header))
+	if len(header) != 76 {
+		return fmt.Errorf("unexpected odc header length: %d", len(header))
 	}
 
 	w.WriteString(header)
 	w.WriteString(nameWithNull)
-
-	// Pad path to 4-byte boundary
-	totalHeader := 110 + len(nameWithNull)
-	if pad := (4 - (totalHeader % 4)) % 4; pad > 0 {
-		w.Write(make([]byte, pad))
-	}
-
 	if filesize > 0 {
 		w.Write(f.Data)
-		// Pad data to 4-byte boundary
-		if pad := (4 - (filesize % 4)) % 4; pad > 0 {
-			w.Write(make([]byte, pad))
-		}
 	}
 
 	return nil
@@ -125,55 +122,90 @@ func ExtractGz(data []byte) ([]FileEntry, error) {
 	return Extract(raw)
 }
 
-// Extract parses an uncompressed cpio stream.
+// Extract parses an uncompressed cpio stream (supporting both odc and new ASCII formats).
 func Extract(data []byte) ([]FileEntry, error) {
 	var entries []FileEntry
 	offset := 0
 
-	for offset+110 <= len(data) {
+	for offset+76 <= len(data) {
 		magic := string(data[offset : offset+6])
-		if magic != Magic {
-			break
-		}
 
-		var namesize, filesize uint32
-		_, _ = fmt.Sscanf(string(data[offset+94:offset+102]), "%x", &namesize)
-		_, _ = fmt.Sscanf(string(data[offset+54:offset+62]), "%x", &filesize)
+		if magic == Magic {
+			// POSIX odc (76-byte header)
+			var namesize, filesize uint32
+			_, _ = fmt.Sscanf(string(data[offset+59:offset+65]), "%o", &namesize)
+			_, _ = fmt.Sscanf(string(data[offset+65:offset+76]), "%o", &filesize)
 
-		offset += 110
-		if offset+int(namesize) > len(data) {
-			break
-		}
-
-		name := string(data[offset : offset+int(namesize)-1]) // strip NUL
-		offset += int(namesize)
-
-		// Align to 4 bytes
-		if pad := (4 - ((110 + int(namesize)) % 4)) % 4; pad > 0 {
-			offset += pad
-		}
-
-		if name == "TRAILER!!!" {
-			break
-		}
-
-		var fileData []byte
-		if filesize > 0 {
-			if offset+int(filesize) > len(data) {
+			offset += 76
+			if offset+int(namesize) > len(data) {
 				break
 			}
-			fileData = make([]byte, filesize)
-			copy(fileData, data[offset:offset+int(filesize)])
-			offset += int(filesize)
-			if pad := (4 - (int(filesize) % 4)) % 4; pad > 0 {
+
+			name := string(data[offset : offset+int(namesize)-1]) // strip NUL
+			offset += int(namesize)
+
+			if name == "TRAILER!!!" {
+				break
+			}
+
+			var fileData []byte
+			if filesize > 0 {
+				if offset+int(filesize) > len(data) {
+					break
+				}
+				fileData = make([]byte, filesize)
+				copy(fileData, data[offset:offset+int(filesize)])
+				offset += int(filesize)
+			}
+
+			entries = append(entries, FileEntry{
+				Name: name,
+				Data: fileData,
+			})
+		} else if magic == MagicNewASCII {
+			// SVR4 new ASCII (110-byte header with 4-byte padding)
+			if offset+110 > len(data) {
+				break
+			}
+			var namesize, filesize uint32
+			_, _ = fmt.Sscanf(string(data[offset+94:offset+102]), "%x", &namesize)
+			_, _ = fmt.Sscanf(string(data[offset+54:offset+62]), "%x", &filesize)
+
+			offset += 110
+			if offset+int(namesize) > len(data) {
+				break
+			}
+
+			name := string(data[offset : offset+int(namesize)-1])
+			offset += int(namesize)
+			if pad := (4 - ((110 + int(namesize)) % 4)) % 4; pad > 0 {
 				offset += pad
 			}
-		}
 
-		entries = append(entries, FileEntry{
-			Name: name,
-			Data: fileData,
-		})
+			if name == "TRAILER!!!" {
+				break
+			}
+
+			var fileData []byte
+			if filesize > 0 {
+				if offset+int(filesize) > len(data) {
+					break
+				}
+				fileData = make([]byte, filesize)
+				copy(fileData, data[offset:offset+int(filesize)])
+				offset += int(filesize)
+				if pad := (4 - (int(filesize) % 4)) % 4; pad > 0 {
+					offset += pad
+				}
+			}
+
+			entries = append(entries, FileEntry{
+				Name: name,
+				Data: fileData,
+			})
+		} else {
+			break
+		}
 	}
 
 	return entries, nil

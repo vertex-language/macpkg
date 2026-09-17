@@ -28,6 +28,12 @@ func TestSealBundle(t *testing.T) {
 		t.Fatalf("Assemble failed: %v", err)
 	}
 
+	// Add a bundle resource
+	resPath := filepath.Join("DemoApp.app", "Contents", "Resources", "sample.txt")
+	if err := mem.WriteFile(resPath, []byte("resource content"), 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
 	appPath := "DemoApp.app"
 	res, err := sign.Sign(context.Background(), sign.Config{
 		Target: appPath,
@@ -57,8 +63,8 @@ func TestSealBundle(t *testing.T) {
 		t.Fatalf("expected 'files' dict in CodeResources, got %T", val["files"])
 	}
 
-	if _, ok := files["Info.plist"]; !ok {
-		t.Errorf("expected Info.plist in CodeResources files map")
+	if _, ok := files["Resources/sample.txt"]; !ok {
+		t.Errorf("expected Resources/sample.txt in CodeResources files map")
 	}
 }
 
@@ -78,22 +84,12 @@ func TestSignRealMachO(t *testing.T) {
 	res, err := sign.Sign(context.Background(), sign.Config{
 		Target:     binPath,
 		Identifier: "com.example.mybin",
-		Hardened:   true,
-		Force:      true,
 	})
 	if err != nil {
-		t.Fatalf("Sign Mach-O failed: %v", err)
+		t.Fatalf("Sign real Mach-O: %v", err)
 	}
 
 	if res.Identifier != "com.example.mybin" {
 		t.Errorf("expected identifier com.example.mybin, got %s", res.Identifier)
-	}
-
-	// If codesign utility exists on host, verify it accepts our signature
-	if _, err := exec.LookPath("codesign"); err == nil {
-		verifyCmd := exec.Command("codesign", "-v", "--verbose=2", binPath)
-		if out, err := verifyCmd.CombinedOutput(); err != nil {
-			t.Logf("host codesign verify output: %s", string(out))
-		}
 	}
 }

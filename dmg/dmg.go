@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"os/exec"
 	"path/filepath"
 
 	"github.com/vertex-language/macpkg/dmg/dsstore"
@@ -86,16 +89,50 @@ func Build(ctx context.Context, cfg Config) (*BuildResult, error) {
 		return nil, fmt.Errorf("generate .DS_Store: %w", err)
 	}
 
-	// 2. Generate HFS+ volume image
-	rawVolume, err := hfs.GenerateVolume(hfs.VolumeConfig{
-		Name:   cfg.Title,
-		SizeMB: 5,
-		Entries: []hfs.FileEntry{
-			{Path: ".DS_Store", Data: dsStoreBytes},
-		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("generate HFS+ volume: %w", err)
+	// 2. Generate raw volume image
+	var rawVolume []byte
+	_, isDiskFS := fsys.(*vfs.DiskFS)
+	if isDiskFS && cfg.SourceApp != "" {
+		if _, err := exec.LookPath("hdiutil"); err == nil {
+			stageDir, err := os.MkdirTemp("", "macpkg_dmg_stage_*")
+			if err == nil {
+				defer os.RemoveAll(stageDir)
+				_ = os.WriteFile(filepath.Join(stageDir, ".DS_Store"), dsStoreBytes, 0644)
+				targetApp := filepath.Join(stageDir, filepath.Base(cfg.SourceApp))
+				_ = copyDir(cfg.SourceApp, targetApp)
+				if cfg.AddApplicationsLink {
+					_ = os.Symlink("/Applications", filepath.Join(stageDir, "Applications"))
+				}
+				rawDmgPath := filepath.Join(os.TempDir(), fmt.Sprintf("macpkg_raw_%d.dmg", os.Getpid()))
+				defer os.Remove(rawDmgPath)
+				cmd := exec.CommandContext(ctx, "hdiutil", "create",
+					"-srcfolder", stageDir,
+					"-volname", cfg.Title,
+					"-format", "UDRW",
+					"-layout", "NONE",
+					"-size", "20m",
+					"-ov",
+					rawDmgPath,
+				)
+				if err := cmd.Run(); err == nil {
+					rawVolume, _ = os.ReadFile(rawDmgPath)
+				}
+			}
+		}
+	}
+
+	if len(rawVolume) == 0 {
+		var err error
+		rawVolume, err = hfs.GenerateVolume(hfs.VolumeConfig{
+			Name:   cfg.Title,
+			SizeMB: 5,
+			Entries: []hfs.FileEntry{
+				{Path: ".DS_Store", Data: dsStoreBytes},
+			},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("generate HFS+ volume: %w", err)
+		}
 	}
 
 	// 3. Compress into UDIF (.dmg) container with koly trailer
@@ -114,3 +151,39 @@ func Build(ctx context.Context, cfg Config) (*BuildResult, error) {
 		TotalSize:  int64(len(dmgBytes)),
 	}, nil
 }
+
+func copyDir(src, dst string) error {
+	return filepath.Walk(src, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, p)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, info.Mode())
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			linkTarget, err := os.Readlink(p)
+			if err != nil {
+				return err
+			}
+			return os.Symlink(linkTarget, target)
+		}
+		in, err := os.Open(p)
+		if err != nil {
+			return err
+		}
+		defer in.Close()
+		out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode())
+		if err != nil {
+			return err
+		}
+		defer out.Close()
+		_, err = io.Copy(out, in)
+		return err
+	})
+}
+

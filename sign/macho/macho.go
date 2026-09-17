@@ -523,3 +523,53 @@ func lcName(cmd uint32) string {
 		return fmt.Sprintf("LC_0x%08x", cmd)
 	}
 }
+
+// ExtractCDHash parses a signed Mach-O image and returns the 20-byte CDHash of the primary slice.
+func ExtractCDHash(raw []byte) ([]byte, error) {
+	img, err := Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	if len(img.Slices) == 0 {
+		return nil, errors.New("no slices in Mach-O")
+	}
+	sl := img.Slices[0]
+	if sl.csCmd == nil {
+		return nil, errors.New("no LC_CODE_SIGNATURE load command")
+	}
+
+	bo := sl.order()
+	csOff := int64(bo.Uint32(sl.Bytes[sl.csCmd.Offset+8:]))
+	csSize := int64(bo.Uint32(sl.Bytes[sl.csCmd.Offset+12:]))
+	if csOff+csSize > int64(len(sl.Bytes)) {
+		return nil, errors.New("signature bounds out of range")
+	}
+
+	sb := sl.Bytes[csOff : csOff+csSize]
+	if len(sb) < 12 {
+		return nil, errors.New("superblob too small")
+	}
+
+	count := binary.BigEndian.Uint32(sb[8:12])
+	for i := uint32(0); i < count; i++ {
+		idxOff := 12 + i*8
+		if int(idxOff+8) > len(sb) {
+			break
+		}
+		slotType := binary.BigEndian.Uint32(sb[idxOff:])
+		slotOff := binary.BigEndian.Uint32(sb[idxOff+4:])
+		if slotType == csslotCodeDirectory {
+			if int(slotOff+8) > len(sb) {
+				return nil, errors.New("codedirectory offset out of bounds")
+			}
+			cdLen := binary.BigEndian.Uint32(sb[slotOff+4:])
+			if int(slotOff+cdLen) > len(sb) {
+				return nil, errors.New("codedirectory length out of bounds")
+			}
+			cdBytes := sb[slotOff : slotOff+cdLen]
+			ht := cdBytes[37]
+			return cdHash(cdBytes, ht), nil
+		}
+	}
+	return nil, errors.New("no CodeDirectory found in signature")
+}

@@ -2,10 +2,13 @@ package pkg
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io/fs"
-	"path"
+	"path/filepath"
+	"sort"
+	"strings"
 
 	"github.com/vertex-language/macpkg/pkg/bom"
 	"github.com/vertex-language/macpkg/pkg/cpio"
@@ -57,10 +60,17 @@ func Build(ctx context.Context, cfg Config) (*BuildResult, error) {
 	// 1. Gather payload files
 	files := make(map[string][]byte)
 	for k, v := range cfg.PayloadFiles {
-		files[k] = v
+		clean := filepath.Clean(k)
+		clean = strings.TrimPrefix(clean, "./")
+		clean = strings.TrimPrefix(clean, "/")
+		files[clean] = v
 	}
 
 	if cfg.SourcePayload != "" {
+		baseDir := cfg.SourcePayload
+		if filepath.Ext(cfg.SourcePayload) == ".app" {
+			baseDir = filepath.Dir(cfg.SourcePayload)
+		}
 		err := fsys.WalkDir(cfg.SourcePayload, func(p string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
@@ -70,7 +80,14 @@ func Build(ctx context.Context, cfg Config) (*BuildResult, error) {
 				if err != nil {
 					return err
 				}
-				files[p] = data
+				rel, err := filepath.Rel(baseDir, p)
+				if err != nil {
+					rel = p
+				}
+				rel = filepath.Clean(rel)
+				rel = strings.TrimPrefix(rel, "./")
+				rel = strings.TrimPrefix(rel, "/")
+				files[rel] = data
 			}
 			return nil
 		})
@@ -83,49 +100,104 @@ func Build(ctx context.Context, cfg Config) (*BuildResult, error) {
 		return nil, errors.New("pkg: no payload files provided")
 	}
 
-	// 2. Build BOM entries & cpio entries
-	var bomEntries []bom.FileEntry
-	var cpioEntries []cpio.FileEntry
+	// Sort file paths for deterministic packaging
+	var sortedPaths []string
+	for p := range files {
+		sortedPaths = append(sortedPaths, p)
+	}
+	sort.Strings(sortedPaths)
 
+	// Collect unique directories for cpio archive
+	dirSet := make(map[string]bool)
+	for _, p := range sortedPaths {
+		parent := filepath.Dir(p)
+		for parent != "." && parent != "/" && parent != "" {
+			dirSet["./"+parent] = true
+			parent = filepath.Dir(parent)
+		}
+		if pDir := filepath.Dir(p); pDir != "." && pDir != "/" && pDir != "" {
+			dirSet["./"+pDir] = true
+		}
+	}
+
+	var sortedDirs []string
+	for d := range dirSet {
+		sortedDirs = append(sortedDirs, d)
+	}
+	sort.Strings(sortedDirs)
+
+	var cpioEntries []cpio.FileEntry
+	// Root directory "."
+	cpioEntries = append(cpioEntries, cpio.FileEntry{
+		Name: ".",
+		Mode: 0040755,
+		UID:  0,
+		GID:  80,
+	})
+	// Subdirectories
+	for _, d := range sortedDirs {
+		cpioEntries = append(cpioEntries, cpio.FileEntry{
+			Name: d,
+			Mode: 0040755,
+			UID:  0,
+			GID:  80,
+		})
+	}
+
+	// Files
+	var bomEntries []bom.FileEntry
 	totalPayloadBytes := uint64(0)
-	for filePath, data := range files {
+
+	for _, p := range sortedPaths {
+		data := files[p]
 		size := uint64(len(data))
 		totalPayloadBytes += size
+
 		mode := uint32(0100644)
-		if path.Ext(filePath) == "" || path.Base(filePath) == "PkgInfo" {
-			mode = uint32(0100755)
+		base := filepath.Base(p)
+		if filepath.Ext(p) == "" || base == "PkgInfo" {
+			mode = 0100755
+		}
+		if len(data) >= 4 {
+			magic := binary.BigEndian.Uint32(data[:4])
+			// Mach-O magics: MH_MAGIC(0xFEEDFACE), MH_MAGIC_64(0xFEEDFACF), MH_CIGAM(0xCEFAEDFE), MH_CIGAM_64(0xCFFAEDFE), FAT(0xCAFEBABE)
+			if magic == 0xFEEDFACE || magic == 0xFEEDFACF || magic == 0xCEFAEDFE || magic == 0xCFFAEDFE || magic == 0xCAFEBABE {
+				mode = 0100755
+			}
 		}
 
-		bomEntries = append(bomEntries, bom.FileEntry{
-			Path: "./" + filePath,
-			Mode: uint16(mode & 0777),
-			UID:  0,
-			GID:  80, // admin
-			Size: size,
-		})
-
+		cpioPath := "./" + p
 		cpioEntries = append(cpioEntries, cpio.FileEntry{
-			Name: filePath,
+			Name: cpioPath,
 			Mode: mode,
 			UID:  0,
 			GID:  80,
 			Data: data,
 		})
+
+		bomEntries = append(bomEntries, bom.FileEntry{
+			Path: cpioPath,
+			Mode: uint16(mode),
+			UID:  0,
+			GID:  80,
+			Size: size,
+			Data: data,
+		})
 	}
 
-	// Generate BOM
+	// 2. Generate BOM
 	bomBytes, err := bom.Generate(bomEntries)
 	if err != nil {
 		return nil, fmt.Errorf("generate BOM: %w", err)
 	}
 
-	// Generate cpio Payload (.cpio.gz)
+	// 3. Generate cpio Payload (.cpio.gz)
 	payloadBytes, err := cpio.ArchiveGz(cpioEntries)
 	if err != nil {
 		return nil, fmt.Errorf("generate cpio Payload: %w", err)
 	}
 
-	// 3. Generate PackageInfo XML
+	// 4. Generate PackageInfo XML
 	pkgInfoXML, err := packageinfo.Generate(packageinfo.Info{
 		Identifier:      cfg.Identifier,
 		Version:         cfg.Version,
@@ -133,14 +205,14 @@ func Build(ctx context.Context, cfg Config) (*BuildResult, error) {
 		Auth:            "root",
 		Payload: packageinfo.Payload{
 			InstallKBytes: (totalPayloadBytes + 1023) / 1024,
-			NumberOfFiles: uint64(len(files)),
+			NumberOfFiles: uint64(len(sortedDirs) + len(sortedPaths) + 1), // dirs + files + root
 		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("generate PackageInfo: %w", err)
 	}
 
-	// 4. Assemble files into XAR archive
+	// 5. Assemble files into XAR archive
 	xarFiles := []xar.FileEntry{
 		{Name: "PackageInfo", Data: pkgInfoXML},
 		{Name: "Payload", Data: payloadBytes},
@@ -169,7 +241,7 @@ func Build(ctx context.Context, cfg Config) (*BuildResult, error) {
 		return nil, fmt.Errorf("archive XAR .pkg: %w", err)
 	}
 
-	// 5. Write to destination
+	// 6. Write to destination
 	if err := fsys.WriteFile(cfg.OutFile, pkgBytes, 0644); err != nil {
 		return nil, fmt.Errorf("write output PKG %s: %w", cfg.OutFile, err)
 	}
