@@ -1,0 +1,32 @@
+# Binaries and build outputs
+bin/
+dist/
+*.dylib
+*.so
+*.o
+*.a
+
+# Apple Packaging outputs
+*.app
+*.dmg
+*.pkg
+*.mpkg
+*.zip
+
+# Certificates & keys
+*.p12
+*.pfx
+*.p8
+*.key
+*.pem
+*.cer
+
+# OS & Editor files
+.DS_Store
+.vscode/
+.idea/
+
+# Test and coverage artifacts
+*.out
+*.test
+*.prof
